@@ -1,0 +1,115 @@
+name: Pkl macOS amendment diagnostics
+on:
+  workflow_dispatch:
+    inputs:
+      tested_sha:
+        required: true
+        type: string
+      baseline_sha:
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  macos-validation:
+    strategy:
+      fail-fast: false
+      matrix:
+        revision: [patch, baseline]
+    runs-on: macos-latest
+    timeout-minutes: 22
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ matrix.revision == 'patch' && inputs.tested_sha || inputs.baseline_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify tested SHA and upstream baseline
+        env:
+          EXPECTED_SHA: ${{ matrix.revision == 'patch' && inputs.tested_sha || inputs.baseline_sha }}
+          BASELINE_SHA: ${{ inputs.baseline_sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          git remote add upstream https://github.com/apple/pkl-lsp.git
+          git fetch upstream main
+          test "$(git rev-parse upstream/main)" = "$BASELINE_SHA"
+          git rev-parse HEAD upstream/main
+          git merge-base --is-ancestor upstream/main HEAD
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961
+        with:
+          java-version: '25'
+          distribution: temurin
+          cache: gradle
+      - name: Full checks with test progress and thread diagnostics
+        env:
+          PKL_ORIGINAL_REMOTE_NAME: upstream
+        run: |
+          cat > "$RUNNER_TEMP/test-progress.gradle" <<'GRADLE'
+          allprojects {
+            tasks.withType(org.gradle.api.tasks.testing.Test).configureEach {
+              testLogging {
+                events 'started', 'passed', 'failed', 'skipped'
+                showStandardStreams = true
+              }
+            }
+          }
+          GRADLE
+          java -version
+          ./gradlew --init-script "$RUNNER_TEMP/test-progress.gradle" cleanTest check shadowJar verifyDistribution --info --console=plain &
+          build_pid=$!
+          (
+            while kill -0 "$build_pid" 2>/dev/null; do
+              sleep 60
+              date >> "$RUNNER_TEMP/thread-diagnostics.txt"
+              for worker_pid in $("$JAVA_HOME/bin/jcmd" -l | awk '/GradleWorkerMain/ { print $1 }'); do
+                "$JAVA_HOME/bin/jcmd" "$worker_pid" Thread.print -l >> "$RUNNER_TEMP/thread-diagnostics.txt" 2>&1 || true
+              done
+            done
+          ) &
+          monitor_pid=$!
+          if wait "$build_pid"; then
+            build_status=0
+          else
+            build_status=$?
+          fi
+          kill "$monitor_pid" 2>/dev/null || true
+          exit "$build_status"
+      - name: Record test execution
+        env:
+          REVISION: ${{ matrix.revision }}
+        run: |
+          python - <<'PYTEST'
+          from pathlib import Path
+          import xml.etree.ElementTree as E
+          import os
+          expected = {'amendableProperties.pkl', 'nonAmendableProperties.pkl', 'nonAmendablePropertyDefinitions.pkl'} if os.environ['REVISION'] == 'patch' else set()
+          for task in ['test', 'verifyDistribution']:
+              files = list(Path('build/test-results', task).glob('TEST-*.xml'))
+              assert files, 'No test results for ' + task
+              roots = [E.parse(p).getroot() for p in files]
+              totals = {k: sum(int(r.attrib.get(k, 0)) for r in roots) for k in ['tests', 'failures', 'errors', 'skipped']}
+              print(task, totals)
+              assert totals['tests'] > 0 and totals['failures'] == totals['errors'] == 0
+              seen = set()
+              for r in roots:
+                  for t in r.findall('testcase'):
+                      if t.find('skipped') is not None:
+                          print('SKIPPED:', task, r.attrib['name'], t.attrib['name'])
+                      if t.attrib['name'] in expected:
+                          assert t.find('skipped') is None and t.find('failure') is None and t.find('error') is None
+                          seen.add(t.attrib['name'])
+              print('REGRESSIONS:', task, sorted(seen))
+              assert seen == expected, (task, seen)
+          PYTEST
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4
+        if: always()
+        with:
+          name: macos-diagnostics-${{ matrix.revision }}
+          path: |
+            build/test-results/**/*.xml
+            build/reports/tests/**/*
+            build/libs/*.jar
+            ${{ runner.temp }}/thread-diagnostics.txt
